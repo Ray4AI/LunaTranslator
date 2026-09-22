@@ -1,5 +1,6 @@
 from qtsymbols import *
-import functools, json
+import functools, json, re, ast
+from traceback import print_exc
 from myutils.wrapper import tryprint
 from gui.usefulwidget import (
     getIconButton,
@@ -148,6 +149,95 @@ class customparams(QWidget):
         return {self._key: collect}
 
 
+# 解析失败哨兵（区别于合法的 None）
+_PARSE_FAILED = object()
+
+
+def _normalize_js_like(text: str) -> str:
+    """把 JS 风格对象/数组字面量尽量归一化为 Python 字面量语法。
+
+    处理顺序很重要：
+      1) 单引号字符串 -> 双引号（先做，后续正则才不会误伤字符串内容）
+      2) JS 关键字 true/false/null -> Python True/False/None
+      3) 字段之间缺逗号 -> 补 `,`（这一步在加引号之前做，这样未引号的 key
+         也能被认出来，后续才能被补上引号）
+      4) 无引号 key -> 双引号 key（此时它们都已跟在 `{` 或 `,` 后面）
+    """
+    s = text
+
+    # 1) 单引号字符串 -> 双引号（只处理不含 escape 和双引号的简单情况）
+    def _sq_to_dq(m):
+        inner = m.group(1).replace('"', '\\"')
+        return '"' + inner + '"'
+
+    s = re.sub(r"'([^'\\]*)'", _sq_to_dq, s)
+
+    # 2) JS 关键字 -> Python 字面量
+    s = re.sub(r"\btrue\b", "True", s)
+    s = re.sub(r"\bfalse\b", "False", s)
+    s = re.sub(r"\bnull\b", "None", s)
+
+    # 3) 字段之间缺逗号：在 value 后跟 `key:` 之间补 `,`
+    #    value 形如：`"str"` / `'str'` / 数字 / `]` / `}` / True / False / None
+    #    key 可以是已加引号的 `"key"` 或未加引号的 `key`
+    s = re.sub(
+        r'([\]}"\']|\d|\bTrue\b|\bFalse\b|\bNone\b)'
+        r'\s+'
+        r'((?:"[A-Za-z0-9_$]+"|[A-Za-z_$][A-Za-z0-9_$]*)\s*:)',
+        r"\1, \2",
+        s,
+    )
+
+    # 4) 无引号 key -> 双引号 key：在 `{` 或 `,` 后出现的 identifier:
+    s = re.sub(
+        r"([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*):",
+        r'\1"\2"\3:',
+        s,
+    )
+    return s
+
+
+def _loose_object_parse(text: str):
+    """尽量宽容地把用户输入的 value 解析为 Python 对象。
+
+    依次尝试：
+      1) 严格 JSON
+      2) Python 字面量 (True/False/None, 单/双引号 key)
+      3) JS 风格归一化后重试（无引号 key、true/false/null、缺逗号）
+
+    失败时返回 _PARSE_FAILED。
+    """
+    s = (text or "").strip()
+    if not s:
+        return _PARSE_FAILED
+
+    # 1) 严格 JSON
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 2) Python 字面量
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        pass
+
+    # 3) JS 风格归一化后重试
+    normalized = _normalize_js_like(s)
+    if normalized != s:
+        try:
+            return ast.literal_eval(normalized)
+        except Exception:
+            pass
+        try:
+            return json.loads(normalized)
+        except Exception:
+            pass
+
+    return _PARSE_FAILED
+
+
 def getcustombodyheaders(customparams: "list[dict]", **kw):
     extrabody = {}
     extraheader = {}
@@ -174,16 +264,28 @@ def getcustombodyheaders(customparams: "list[dict]", **kw):
                 except:
                     continue
             elif t == "other":
-                try:
-                    v = json.loads(v)
-                except:
+                # json/python 类型：尽量宽容地支持 JSON / Python 字面量 / JS 风格
+                # （包括无引号 key、true/false/null、字段间缺逗号）。
+                # 之前只尝试 json.loads + eval，用户填 JS 风格时会被静默 continue 丢掉。
+                parsed = _loose_object_parse(v)
+                # 若失败，再尝试 eval(v, kw)（允许引用上下文变量，保留向后兼容）
+                if parsed is _PARSE_FAILED:
                     try:
-                        v = eval(v, kw)
-                    except:
-                        from traceback import print_exc
-
-                        print_exc()
-                        continue
+                        parsed = eval(v, kw)
+                    except Exception:
+                        parsed = _PARSE_FAILED
+                if parsed is _PARSE_FAILED:
+                    print(
+                        "[LunaTranslator] 其他参数 (json/python) 解析失败，已跳过：\n"
+                        f"  key   = {k!r}\n"
+                        f"  value = {v!r}\n"
+                        "  提示：请用以下任一格式（字段之间务必用逗号分隔）：\n"
+                        "    - JSON 严格格式 : {\"order\": [\"wafer\"], \"allowFallbacks\": false}\n"
+                        "    - Python 字面量 : {'order': ['wafer'], 'allowFallbacks': False}\n"
+                        "    - JS 风格      : {order: ['wafer'], allowFallbacks: false}"
+                    )
+                    continue
+                v = parsed
             extrabody[k] = v
     return extrabody, extraheader
 

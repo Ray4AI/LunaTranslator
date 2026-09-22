@@ -40,6 +40,18 @@ class _ConfigView:
         return (k in self._overrides) or (k in self._base)
 
 
+class _FallbackTriggered(Exception):
+    """流式过程中检测到 fallback 触发条件，需要立刻中断当前流。
+
+    `partial` 是到检测点为止已经流出来的文本（可能包含审查关键词）。
+    顶层 translate() 捕获后应该 `yield "\\0"` 立刻撤回 UI，然后切换到 fallback。
+    """
+
+    def __init__(self, partial: str):
+        self.partial = partial
+        super().__init__("fallback triggered")
+
+
 def list_models(typename, regist: dict):
     return common_list_models(
         getproxy(("fanyi", typename)),
@@ -501,6 +513,44 @@ class gptcommon(basetrans):
             )
         return response, apitype
 
+    def _stream_with_check(self, gen, check_fn):
+        """包装 parsestreamresp 的 generator：每 yield 一个 chunk 就检测累积文本。
+
+        一旦 `check_fn(累积文本)` 返回 True：
+          - 先 yield 当前 chunk（用户能看到触发关键词，不会莫名其妙被擦）
+          - 然后关闭内部 generator 并抛 `_FallbackTriggered`
+          - translate() 捕获后 `yield "\\0"` 立刻擦掉，切 fallback
+        这样能在主模型刚开始吐审查/拦截文案时就中断，不用等整段流完。
+        """
+        accumulated = ""
+        while True:
+            try:
+                chunk = next(gen)
+            except StopIteration as si:
+                # generator 自然结束，透传 return value（完整 message）
+                return si.value
+            should_abort = False
+            trigger_display = ""
+            if chunk == "\0":
+                accumulated = ""
+            elif chunk:
+                accumulated += chunk
+                # markdown2html 模式下 chunk 前缀是 LUNASHOWHTML，检测时去掉
+                display = accumulated
+                if display.startswith("LUNASHOWHTML"):
+                    display = display[len("LUNASHOWHTML") :]
+                if check_fn(display):
+                    should_abort = True
+                    trigger_display = display
+            # 总是 yield 当前 chunk（包括触发的那一个）
+            yield chunk
+            if should_abort:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+                raise _FallbackTriggered(trigger_display)
+
     def translate(self, query_2: GptTextWithDict):
         self.checkempty("API接口地址")
         if isinstance(query_2, str):
@@ -542,15 +592,36 @@ class gptcommon(basetrans):
             try:
                 response, apitype = self._do_request(att, messages, usingstream)
                 if usingstream:
-                    msg = yield from parsestreamresp(
+                    gen = parsestreamresp(
                         apitype, response, hidethinking, markdown2html, att["model"]
                     )
-                    if not is_fb:
+                    if (not is_fb) and (idx + 1 < len(attempts)):
+                        # 主模型 + 已配置 fallback：边流边检测，命中立刻撤回
+                        # 注意：`yield from` 中途 raise 会跳出这里，所以 primary_yielded
+                        # 要提前置 True（只要走过流式就假设 UI 上已有内容）
                         primary_yielded = True
+                        msg = yield from self._stream_with_check(
+                            gen, self._matches_fallback_regex
+                        )
+                    else:
+                        msg = yield from gen
+                        if not is_fb:
+                            primary_yielded = True
                 else:
                     msg = common_parse_normal_response(
                         response, apitype, hidethinking=hidethinking
                     )
+            except _FallbackTriggered as ft:
+                # 流式中途命中审查/拦截正则：立刻撤回 UI，然后切 fallback
+                # 不等 fallback 开始输出才覆盖 —— 就在检测点上马上清空。
+                yield "\0"
+                primary_yielded = False
+                primary_msg = ft.partial
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                continue
             except Exception as e:
                 # 请求/解析出错：符合条件则切到 fallback
                 if (
