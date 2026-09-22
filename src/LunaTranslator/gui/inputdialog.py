@@ -544,8 +544,11 @@ class SuperComboX(SuperCombo):
             painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
 
 
-@Singleton
-class autoinitdialog(LDialog, DarkLightAutoResetIconHelper):
+class autoinitdialog_impl(LDialog, DarkLightAutoResetIconHelper):
+    # 说明：本类被 Singleton 包装成 autoinitdialog（全局唯一）。
+    # 当需要"嵌套对话框"（例如 LLM fallback 提供商配置页）时，
+    # 请使用 subautoinitdialog = autoinitdialog_impl，
+    # 它不走 Singleton，可以和外层 autoinitdialog 同时打开。
     def closeEvent(self, a0):
         if not isqt5:
             for _ in self.__qt6fucker:
@@ -612,7 +615,13 @@ class autoinitdialog(LDialog, DarkLightAutoResetIconHelper):
                 lineWF = getattr(
                     importlib.import_module(self.modelfile), line["function"]
                 )
-                lineW = lineWF(self._dict, key)
+                try:
+                    # 优先把 dialog 传给 custom 组件，方便它拿到 modelfile /
+                    # maybehasextrainfo 等上下文（例如 fallback 子对话框）。
+                    lineW = lineWF(self._dict, key, dialog=self)
+                except TypeError:
+                    # 兼容旧的 custom 组件签名 (dd, key)
+                    lineW = lineWF(self._dict, key)
                 self.updater[key] = lineW.updateValues
             except:
                 print_exc()
@@ -915,6 +924,12 @@ class autoinitdialog(LDialog, DarkLightAutoResetIconHelper):
             self.exec()
         else:
             self.show()
+
+
+# 全局唯一（原有的对外接口，行为不变）
+autoinitdialog = Singleton(autoinitdialog_impl)
+# 非单例版本，用于嵌套子对话框（如 LLM fallback 提供商配置页），可与外层同时打开
+subautoinitdialog = autoinitdialog_impl
 
 
 class postconfigdialog_1(LDialog):

@@ -13,6 +13,32 @@ from myutils.proxy import getproxy
 from language import Languages
 from gui.customparams import getcustombodyheaders
 
+# 为了 fallback 子对话框里能够加载 customparams（参见 gui.customparams.fallbackproviderbutton）
+from gui.customparams import customparams, fallbackproviderbutton  # noqa: F401
+
+
+class _ConfigView:
+    """配置视图：在 base（主配置）上叠一层 overrides（如 fallback.provider）。
+    只覆盖 overrides 中出现的键，其它键仍读 base，用于将同一份请求代码复用到 fallback 通道。
+    """
+
+    def __init__(self, base, overrides: dict = None):
+        self._base = base
+        self._overrides = overrides or {}
+
+    def __getitem__(self, k):
+        if k in self._overrides:
+            return self._overrides[k]
+        return self._base[k]
+
+    def get(self, k, default=None):
+        if k in self._overrides:
+            return self._overrides[k]
+        return self._base.get(k, default)
+
+    def __contains__(self, k):
+        return (k in self._overrides) or (k in self._base)
+
 
 def list_models(typename, regist: dict):
     return common_list_models(
@@ -278,8 +304,10 @@ class gptcommon(basetrans):
     def result_cache_key(self, src, tgt, sentence):
         __ = {}
         __.update(self.rawconfig)
-        if "modellistcache" in __:
-            __.pop("modellistcache")
+        # 纯 UI/缓存类字段不参与 key，否则刷新模型列表会清翻译缓存
+        for _k in ("modellistcache", "fallback.provider"):
+            if _k in __:
+                __.pop(_k)
         return (
             src,
             tgt,
@@ -292,7 +320,186 @@ class gptcommon(basetrans):
         self._context_skipinter = 0
         self._context_skipinter_shouldmove = False
         self.maybeuse = {}
+        self._fallback_key_idx = 0
         super().__init__(typename)
+
+    # ---------------- Fallback 相关 ----------------
+
+    def _fallback_provider(self) -> dict:
+        fb = self.config.get("fallback.provider")
+        return fb if isinstance(fb, dict) else {}
+
+    def _fallback_patterns(self) -> "list[str]":
+        raw = self.config.get("fallback.trigger_regex") or ""
+        return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    def _matches_fallback_regex(self, text) -> bool:
+        pats = self._fallback_patterns()
+        if not pats or not text:
+            return False
+        flags = re.IGNORECASE if self.config.get("fallback.ignorecase", True) else 0
+        for p in pats:
+            try:
+                if re.search(p, text, flags):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    @staticmethod
+    def _error_to_text(e: Exception) -> str:
+        parts = []
+        for arg in getattr(e, "args", []):
+            if isinstance(arg, requests.Response):
+                try:
+                    parts.append(arg.text)
+                except Exception:
+                    parts.append(repr(arg))
+            else:
+                parts.append(str(arg))
+        if not parts:
+            parts.append(str(e))
+        return "\n".join(parts)
+
+    def _should_fallback_on_response(self, msg) -> bool:
+        if not self.config.get("fallback.enabled", False):
+            return False
+        return self._matches_fallback_regex(msg)
+
+    def _should_fallback_on_error(self, e: Exception) -> bool:
+        if not self.config.get("fallback.enabled", False):
+            return False
+        if self.config.get("fallback.on_any_error", False):
+            return True
+        return self._matches_fallback_regex(self._error_to_text(e))
+
+    def _next_fallback_key(self, raw) -> str:
+        keys = [k.strip() for k in (raw or "").split("|") if k.strip()]
+        if not keys:
+            return ""
+        self._fallback_key_idx = (self._fallback_key_idx + 1) % len(keys)
+        return keys[self._fallback_key_idx]
+
+    def _mkattempt(
+        self, api_url, api_key, model, cfg_overrides, extrabody, extraheader, is_fallback
+    ):
+        return {
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": model,
+            "cfgview": _ConfigView(self.config, cfg_overrides),
+            "extrabody": extrabody,
+            "extraheader": extraheader,
+            "is_fallback": is_fallback,
+        }
+
+    def _mkfallbackattempt(self):
+        """构造 fallback 请求参数。未启用或未配置完整时返回 None。"""
+        if not self.config.get("fallback.enabled", False):
+            return None
+        fbcfg = self._fallback_provider()
+        api_url = (fbcfg.get("API接口地址") or "").strip()
+        model = (fbcfg.get("model") or "").strip()
+        if not api_url or not model:
+            return None
+        api_key = self._next_fallback_key(fbcfg.get("SECRET_KEY"))
+        # fallback 自己的 extrabody/headers（与主提供商独立）
+        extrabody, extraheader = getcustombodyheaders(
+            fbcfg.get("customparams") or [],
+            config=self.config,
+            fbcfg=fbcfg,
+            self=self,
+        )
+        return self._mkattempt(
+            api_url, api_key, model, fbcfg, extrabody, extraheader, True
+        )
+
+    # ---------------- 请求 ----------------
+
+    def _request_gemini_ex(
+        self, apitype, cfg, api_key, messages: list, extrabody, extraheader
+    ):
+        sysprompt = messages[0]["content"]
+        messages.pop(0)
+        for i, item in enumerate(messages):
+            messages[i] = {
+                "role": {"assistant": "model", "user": "user"}[item["role"]],
+                "parts": [{"text": item["content"]}],
+            }
+        return common_create_gemini_request(
+            self.proxysession,
+            cfg,
+            api_key,
+            sysprompt,
+            messages,
+            extraheader,
+            extrabody,
+            apitype,
+        )
+
+    def _req_claude_ex(self, cfg, api_key, messages: list, extrabody, extraheader):
+        sysprompt = messages[0]["content"]
+        messages.pop(0)
+        cache_control = cfg.get("cachecontext", True)
+        if cache_control and isinstance(sysprompt, str):
+            sysprompt = [
+                {
+                    "type": "text",
+                    "text": sysprompt,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ]
+        headers = {
+            "anthropic-version": "2023-06-01",
+            "accept": "application/json",
+            "X-Api-Key": api_key,
+        }
+        usingstream = cfg.get("流式输出", False)
+        data = dict(
+            model=cfg["model"],
+            messages=messages,
+            system=sysprompt,
+            max_tokens=cfg["max_tokens"],
+            stream=usingstream,
+        )
+        if cfg.get("Temperature.use", True):
+            data.update(temperature=cfg["Temperature"])
+        headers.update(extraheader)
+        data.update(extrabody)
+        response = self.proxysession.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=data,
+            stream=usingstream,
+        )
+        return response
+
+    def _do_request(self, att: dict, messages: list, usingstream: bool):
+        apitype = APIType(att["api_url"])
+        cfg = att["cfgview"]
+        # gemini / claude 分支会原地修改 messages，这里传副本
+        _messages = [dict(m) for m in messages]
+        if apitype == APIType.gemini:
+            response = self._request_gemini_ex(
+                apitype, cfg, att["api_key"], _messages,
+                att["extrabody"], att["extraheader"],
+            )
+        elif apitype == APIType.claude:
+            response = self._req_claude_ex(
+                cfg, att["api_key"], _messages,
+                att["extrabody"], att["extraheader"],
+            )
+        else:
+            headers = createheaders(
+                apitype, att["api_key"], self.maybeuse, self.proxy, att["extraheader"]
+            )
+            _json = common_create_gpt_data(
+                cfg, self.__parse_qwen_mt_turbo(apitype, _messages), att["extrabody"]
+            )
+            response = self.proxysession.post(
+                apitype.finalurl(), headers=headers, json=_json, stream=usingstream
+            )
+        return response, apitype
 
     def translate(self, query_2: GptTextWithDict):
         self.checkempty("API接口地址")
@@ -303,41 +510,87 @@ class gptcommon(basetrans):
         )
         usingstream = self.config["流式输出"]
         messages, query, query_1 = self.commoncreatemessages(query_2)
-        apitype = APIType(self.config.get("API接口地址", ""))
-        if apitype == APIType.gemini:
-            response = self.request_gemini(apitype, messages, extrabody, extraheader)
-        elif apitype == APIType.claude:
-            response = self.req_claude(
-                messages, extrabody, extraheader, self.config.get("cachecontext", True)
-            )
-        else:
-            headers = createheaders(
-                apitype,
-                self.multiapikeycurrent["SECRET_KEY"],
-                self.maybeuse,
-                self.proxy,
-                extraheader,
-            )
-            _json = common_create_gpt_data(
-                self.config, self.__parse_qwen_mt_turbo(apitype, messages), extrabody
-            )
-            response = self.proxysession.post(
-                apitype.finalurl(), headers=headers, json=_json, stream=usingstream
-            )
         hidethinking = self.config.get("hidethinking", True)
         markdown2html = self.config.get("markdown2html", False)
-        if usingstream:
-            respmessage = yield from parsestreamresp(
-                apitype, response, hidethinking, markdown2html, self.config["model"]
+
+        # 依次尝试：主提供商 -> fallback 提供商
+        attempts = [
+            self._mkattempt(
+                self.config["API接口地址"],
+                self.multiapikeycurrent["SECRET_KEY"],
+                self.config["model"],
+                {},
+                extrabody,
+                extraheader,
+                False,
             )
-        else:
-            respmessage = common_parse_normal_response(
-                response, apitype, hidethinking=hidethinking
-            )
-            if markdown2html:
-                yield "LUNASHOWHTML" + NativeUtils.Markdown2Html(respmessage)
-            else:
-                yield respmessage
+        ]
+        fb = self._mkfallbackattempt()
+        if fb is not None:
+            attempts.append(fb)
+
+        respmessage = None
+        primary_msg = None  # 主模型解析出的完整内容（可能包含审查关键词）
+        primary_yielded = False  # 主模型内容是否已经 yield 到 UI
+
+        for idx, att in enumerate(attempts):
+            is_fb = att["is_fallback"]
+            if is_fb and primary_yielded:
+                # 切到 fallback 前清空 UI，避免残留审查/拦截提示文本
+                yield "\0"
+                primary_yielded = False
+            try:
+                response, apitype = self._do_request(att, messages, usingstream)
+                if usingstream:
+                    msg = yield from parsestreamresp(
+                        apitype, response, hidethinking, markdown2html, att["model"]
+                    )
+                    if not is_fb:
+                        primary_yielded = True
+                else:
+                    msg = common_parse_normal_response(
+                        response, apitype, hidethinking=hidethinking
+                    )
+            except Exception as e:
+                # 请求/解析出错：符合条件则切到 fallback
+                if (
+                    (not is_fb)
+                    and (idx + 1 < len(attempts))
+                    and self._should_fallback_on_error(e)
+                ):
+                    continue
+                if is_fb and primary_msg is not None:
+                    # fallback 也失败，但主模型至少有内容，展示主模型结果
+                    respmessage = primary_msg
+                    yield "\0"
+                    if markdown2html:
+                        yield "LUNASHOWHTML" + NativeUtils.Markdown2Html(respmessage)
+                    else:
+                        yield respmessage
+                    break
+                raise
+
+            # 正则命中审查/拦截关键词：切到 fallback
+            if (
+                (not is_fb)
+                and (idx + 1 < len(attempts))
+                and self._should_fallback_on_response(msg)
+            ):
+                primary_msg = msg
+                continue
+
+            # 成功（或 fallback 已经拿到结果）
+            respmessage = msg
+            if not usingstream:
+                if is_fb and primary_yielded:
+                    yield "\0"
+                    primary_yielded = False
+                if markdown2html:
+                    yield "LUNASHOWHTML" + NativeUtils.Markdown2Html(respmessage)
+                else:
+                    yield respmessage
+            break
+
         if not (respmessage and query_1.strip() and respmessage.strip()):
             return
         # 改为始终使用query来作为history请求
@@ -446,59 +699,22 @@ class gptcommon(basetrans):
         return message, query, query_1
 
     def request_gemini(self, apitype, messages: list, extrabody, extraheader):
-
-        sysprompt = messages[0]["content"]
-        messages.pop(0)
-        for i, item in enumerate(messages):
-            messages[i] = {
-                "role": {"assistant": "model", "user": "user"}[item["role"]],
-                "parts": [{"text": item["content"]}],
-            }
-        return common_create_gemini_request(
-            self.proxysession,
+        # 保留原有签名供外部调用（内部转发到参数化版本）
+        return self._request_gemini_ex(
+            apitype,
             self.config,
             self.multiapikeycurrent["SECRET_KEY"],
-            sysprompt,
             messages,
-            extraheader,
             extrabody,
-            apitype,
+            extraheader,
         )
 
     def req_claude(self, messages: list, extrabody, extraheader, cache_control):
-        sysprompt = messages[0]["content"]
-        messages.pop(0)
-
-        if cache_control and isinstance(sysprompt, str):
-            sysprompt = [
-                {
-                    "type": "text",
-                    "text": sysprompt,
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                }
-            ]
-        headers = {
-            "anthropic-version": "2023-06-01",
-            "accept": "application/json",
-            "X-Api-Key": self.multiapikeycurrent["SECRET_KEY"],
-        }
-
-        usingstream = self.config["流式输出"]
-        data = dict(
-            model=self.config["model"],
-            messages=messages,
-            system=sysprompt,
-            max_tokens=self.config["max_tokens"],
-            stream=usingstream,
+        # 保留原有签名供外部调用（内部转发到参数化版本）
+        return self._req_claude_ex(
+            self.config,
+            self.multiapikeycurrent["SECRET_KEY"],
+            messages,
+            extrabody,
+            extraheader,
         )
-        if self.config.get("Temperature.use", True):
-            data.update(temperature=self.config["Temperature"])
-        headers.update(extraheader)
-        data.update(extrabody)
-        response = self.proxysession.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=data,
-            stream=usingstream,
-        )
-        return response

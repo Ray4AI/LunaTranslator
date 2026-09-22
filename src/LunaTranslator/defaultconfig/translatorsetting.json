@@ -421,7 +421,12 @@
 			"prefill": "",
 			"prefill_use": false,
 			"markdown2html": false,
-			"customparams": []
+			"customparams": [],
+			"fallback.enabled": false,
+			"fallback.on_any_error": false,
+			"fallback.trigger_regex": "",
+			"fallback.ignorecase": true,
+			"fallback.provider": {}
 		},
 		"argstype": {
 			"thinking.type": {
@@ -557,6 +562,37 @@
 				"min": 0,
 				"max": 2,
 				"step": 0.01
+			},
+			"s_fallback": {
+				"type": "split",
+				"rank": 7
+			},
+			"fallback.enabled": {
+				"name": "启用 Fallback（主模型被审查/出错时切换到备用提供商）",
+				"type": "switch",
+				"rank": 7.05
+			},
+			"fallback.on_any_error": {
+				"name": "请求出错时也 Fallback（不匹配正则）",
+				"type": "switch",
+				"rank": 7.1
+			},
+			"fallback.trigger_regex": {
+				"name": "Fallback 触发正则（每行一条，命中即切换）",
+				"type": "multiline",
+				"rank": 7.2,
+				"placeholder": "内容.*违规|包含.*敏感|被拦截|不允许服务|审核不通过|无法提供|违反.*规定|sensitive|blocked|violates|policy|unable to provide"
+			},
+			"fallback.ignorecase": {
+				"name": "正则忽略大小写",
+				"type": "switch",
+				"rank": 7.3
+			},
+			"fallback.provider": {
+				"name": "Fallback 提供商",
+				"type": "custom",
+				"function": "fallbackproviderbutton",
+				"rank": 7.4
 			}
 		}
 	},
