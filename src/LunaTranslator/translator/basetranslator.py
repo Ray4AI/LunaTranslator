@@ -1,5 +1,5 @@
 from traceback import print_exc
-from threading import Thread
+from threading import Thread, Lock
 import time, types
 import gobject
 import json
@@ -11,6 +11,17 @@ from myutils.commonbase import ArgsEmptyExc, commonbase
 
 
 class Interrupted(Exception):
+    pass
+
+
+class RequestCancelled(Exception):
+    """请求被外部取消（用户切换到下一句字幕且开启了 cancel_previous_request）。
+
+    与 Interrupted 不同：Interrupted 是"等结果时不等了"（线程还在跑），
+    RequestCancelled 是"主动杀掉这个请求"（关 HTTP 连接、退出 generator）。
+    translate_and_collect 收到后不写缓存、不 callback 终态。
+    """
+
     pass
 
 
@@ -137,12 +148,62 @@ class basetrans(commonbase):
 
         self.newline = None
 
+        # 取消机制：generation 计数 + 当前 response 追踪
+        # cancel_previous() 会让所有旧 generation 的请求立刻退出（不 fallback、不缓存）
+        self._cancel_gen = 0
+        self._current_response = None
+        self._cancel_lock = Lock()
+
         threader(self._fythread)()
 
     def _private_init(self):
         self.initok = False
         self.init()
         self.initok = True
+
+    # ---------------- 取消机制 ----------------
+
+    def cancel_previous(self):
+        """取消当前在飞的请求（如果有）：bump generation + 关 response。
+
+        之后所有旧 generation 的 translate() 会在下一个检查点 return，
+        _do_request 也会拒绝注册新 response 并抛 RequestCancelled。
+        """
+        with self._cancel_lock:
+            self._cancel_gen += 1
+            r = self._current_response
+            self._current_response = None
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    def _new_request_gen(self):
+        """translate() 启动时调用，拿到当前 generation 作为自己的身份。"""
+        with self._cancel_lock:
+            return self._cancel_gen
+
+    def _is_cancelled(self, gen) -> bool:
+        with self._cancel_lock:
+            return self._cancel_gen != gen
+
+    def _register_response(self, gen, response) -> bool:
+        """把 response 登记为"当前在飞"。若 generation 已过期，直接关 response 并返回 False。"""
+        with self._cancel_lock:
+            if self._cancel_gen != gen:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return False
+            self._current_response = response
+            return True
+
+    def _unregister_response(self, response):
+        with self._cancel_lock:
+            if self._current_response is response:
+                self._current_response = None
 
     @property
     def using_gpt_dict(self):
@@ -297,12 +358,16 @@ class basetrans(commonbase):
         callback = self.maybezhconvwrapper(callback, tgtlang_1)
         if isinstance(res, types.GeneratorType):
             collectiterres = ""
-            for _res in res:
-                if _res == "\0":
-                    collectiterres = ""
-                elif _res:  # 可能为None
-                    collectiterres += _res
-                callback(collectiterres, 1)
+            try:
+                for _res in res:
+                    if _res == "\0":
+                        collectiterres = ""
+                    elif _res:  # 可能为None
+                        collectiterres += _res
+                    callback(collectiterres, 1)
+            except RequestCancelled:
+                # 请求被用户切换字幕时取消：不写缓存、不发终态 callback
+                return
             callback(collectiterres, 2)
             res = collectiterres
 
@@ -378,6 +443,10 @@ class basetrans(commonbase):
                     # 离线翻译例如sakura不要被中断，因为即使中断了，部署的服务仍然在运行，直到请求结束
                     func()
                 else:
+                    # 用户点到下一句字幕：可选立刻取消上一个在飞的请求
+                    # （默认关，保留"后台跑完写缓存"的老行为；打开后翻字幕快时不再堆积挂住的请求）
+                    if self.config.get("cancel_previous_request", False):
+                        self.cancel_previous()
                     timeoutfunction(
                         func,
                         checktutukufunction=checktutukufunction,

@@ -209,14 +209,60 @@ class GptTextWithDict:
         self.dictionary = GptDict()
 
 
-class basetrans(commonbase):
+class RequestCancelled(Exception):
     pass
+
+
+class basetrans(commonbase):
+    def __init__(self, typename):
+        super().__init__(typename)
+        import threading
+
+        self._cancel_gen = 0
+        self._current_response = None
+        self._cancel_lock = threading.Lock()
+
+    def cancel_previous(self):
+        with self._cancel_lock:
+            self._cancel_gen += 1
+            r = self._current_response
+            self._current_response = None
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    def _new_request_gen(self):
+        with self._cancel_lock:
+            return self._cancel_gen
+
+    def _is_cancelled(self, gen):
+        with self._cancel_lock:
+            return self._cancel_gen != gen
+
+    def _register_response(self, gen, response):
+        with self._cancel_lock:
+            if self._cancel_gen != gen:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return False
+            self._current_response = response
+            return True
+
+    def _unregister_response(self, response):
+        with self._cancel_lock:
+            if self._current_response is response:
+                self._current_response = None
 
 
 bt = types.ModuleType("translator.basetranslator")
 bt.basetrans = basetrans
 bt.GptDict = GptDict
 bt.GptTextWithDict = GptTextWithDict
+bt.RequestCancelled = RequestCancelled
 sys.modules["translator.basetranslator"] = bt
 
 
@@ -285,6 +331,8 @@ BASE_CFG = {
     "fallback.on_any_error": False,
     "fallback.trigger_regex": "违规|blocked|sensitive",
     "fallback.ignorecase": True,
+    "fallback.first_token_timeout": 2.0,
+    "fallback.first_token_timeout.use": True,
     "fallback.provider": {
         "API接口地址": "https://fallback.example/v1",
         "SECRET_KEY": "FB_KEY_1|FB_KEY_2",

@@ -426,6 +426,9 @@
 			"fallback.on_any_error": false,
 			"fallback.trigger_regex": "",
 			"fallback.ignorecase": true,
+			"fallback.first_token_timeout": 2.0,
+			"fallback.first_token_timeout.use": true,
+			"cancel_previous_request": true,
 			"fallback.provider": {}
 		},
 		"argstype": {
@@ -587,6 +590,23 @@
 				"name": "正则忽略大小写",
 				"type": "switch",
 				"rank": 7.3
+			},
+			"fallback.first_token_timeout": {
+				"name": "主接口首 token 超时（秒；针对接口对 NSFW 静默不响应）",
+				"type": "spin",
+				"min": 0,
+				"max": 60,
+				"step": 0.1,
+				"refswitch": "fallback.first_token_timeout.use",
+				"rank": 7.35
+			},
+			"fallback.first_token_timeout.use": {
+				"type": "switch"
+			},
+			"cancel_previous_request": {
+				"name": "新请求到达时立刻取消上一个翻译请求（翻字幕快时推荐开，避免后台堆积）",
+				"type": "switch",
+				"rank": 2.45
 			},
 			"fallback.provider": {
 				"name": "Fallback 提供商",

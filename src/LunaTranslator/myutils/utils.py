@@ -1200,6 +1200,7 @@ def common_create_gemini_request(
     extraheader,
     extrabody,
     apitype: APIType,
+    timeout=None,
 ):
     gen_config = {
         "maxOutputTokens": config["max_tokens"],
@@ -1265,6 +1266,7 @@ def common_create_gemini_request(
         params={"key": key},
         json=payload,
         stream=usingstream,
+        timeout=timeout,
     )
     return res
 

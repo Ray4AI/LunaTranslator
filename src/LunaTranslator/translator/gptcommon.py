@@ -1,5 +1,5 @@
-from translator.basetranslator import basetrans, GptTextWithDict, GptDict
-import json, requests, hmac, hashlib, NativeUtils, re, functools
+from translator.basetranslator import basetrans, GptTextWithDict, GptDict, RequestCancelled
+import json, requests, hmac, hashlib, NativeUtils, re, functools, threading, queue
 from datetime import datetime, timezone
 from myutils.utils import (
     APIType,
@@ -50,6 +50,89 @@ class _FallbackTriggered(Exception):
     def __init__(self, partial: str):
         self.partial = partial
         super().__init__("fallback triggered")
+
+
+class _FirstTokenTimeout(Exception):
+    """主接口首 token 超时：接口对 NSFW 文本静默不响应，既不报错也不回复审查文案。
+
+    与 _FallbackTriggered 不同，这里 UI 上没流出任何内容，无需撤回。
+    """
+
+    def __init__(self, timeout_s: float):
+        self.timeout_s = timeout_s
+        super().__init__(
+            "first token not received within {}s".format(timeout_s)
+        )
+
+
+def _iter_with_first_token_timeout(inner_iter, timeout_s: float, response=None):
+    """包装一个行迭代器：首行必须在 `timeout_s` 秒内到达，否则抛 `_FirstTokenTimeout`。
+
+    首行之后的行不设超时（阻塞等待）——符合“首 token 超时”的语义。
+    实现：后台线程持续读 `inner_iter` 并推到 queue；主线程按需取。
+    首次 `queue.get` 带 timeout，之后 `timeout=None`（不限）。
+
+    `response` 可选：超时时调用它的 close() 释放 socket，让后台读线程能退出。
+    """
+    q: "queue.Queue" = queue.Queue()
+
+    def _reader():
+        try:
+            for item in inner_iter:
+                q.put(("line", item))
+            q.put(("eof", None))
+        except BaseException as e:  # noqa: BLE001 —— 任何异常都传回主线程
+            q.put(("err", e))
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    first = True
+    while True:
+        timeout = timeout_s if first else None
+        try:
+            kind, payload = q.get(timeout=timeout)
+        except queue.Empty:
+            # 首行超时：关闭底层 response 释放 socket，后台读线程会因此终止
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            raise _FirstTokenTimeout(timeout_s)
+        first = False
+        if kind == "line":
+            yield payload
+        elif kind == "eof":
+            return
+        elif kind == "err":
+            raise payload
+
+
+class _ResponseProxy:
+    """代理 requests.Response：仅把 `iter_lines()` 换成带首 token 超时的版本。
+
+    其它属性/方法（status_code, close, json, text, ...）透传给底层 response，
+    所以 `parsestreamresp` / `common_parse_normal_response` 可以透明使用。
+    """
+
+    def __init__(self, response, first_token_timeout: float):
+        self._response = response
+        self._first_token_timeout = first_token_timeout
+        self._wrapped_once = False
+
+    def iter_lines(self, *args, **kwargs):
+        inner = self._response.iter_lines(*args, **kwargs)
+        if self._wrapped_once:
+            # 同一 response 多次 iter_lines() 时，只包装第一次
+            return inner
+        self._wrapped_once = True
+        return _iter_with_first_token_timeout(
+            inner, self._first_token_timeout, response=self._response
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
 
 
 def list_models(typename, regist: dict):
@@ -381,9 +464,29 @@ class gptcommon(basetrans):
     def _should_fallback_on_error(self, e: Exception) -> bool:
         if not self.config.get("fallback.enabled", False):
             return False
+        # 首 token 超时（自定义 _FirstTokenTimeout 或 requests 内置 Timeout）：
+        # 独立触发 fallback，不受 fallback.on_any_error 影响。
+        # 场景：某些接口对 NSFW 文本既不报错也不回复审查文案，而是直接挂住不响应。
+        if isinstance(e, (_FirstTokenTimeout, requests.exceptions.Timeout)):
+            return True
         if self.config.get("fallback.on_any_error", False):
             return True
         return self._matches_fallback_regex(self._error_to_text(e))
+
+    def _first_token_timeout_s(self) -> float:
+        """返回启用状态下的首 token 超时秒数；未启用或非法值返回 0（不限）。
+
+        由两个配置共同决定：
+          - fallback.first_token_timeout.use  开关（关了就完全不启用此特性）
+          - fallback.first_token_timeout      秒数（<=0 也视为禁用）
+        """
+        if not self.config.get("fallback.first_token_timeout.use", False):
+            return 0.0
+        try:
+            v = float(self.config.get("fallback.first_token_timeout") or 0)
+        except Exception:
+            return 0.0
+        return v if v > 0 else 0.0
 
     def _next_fallback_key(self, raw) -> str:
         keys = [k.strip() for k in (raw or "").split("|") if k.strip()]
@@ -429,7 +532,8 @@ class gptcommon(basetrans):
     # ---------------- 请求 ----------------
 
     def _request_gemini_ex(
-        self, apitype, cfg, api_key, messages: list, extrabody, extraheader
+        self, apitype, cfg, api_key, messages: list, extrabody, extraheader,
+        timeout=None,
     ):
         sysprompt = messages[0]["content"]
         messages.pop(0)
@@ -447,9 +551,10 @@ class gptcommon(basetrans):
             extraheader,
             extrabody,
             apitype,
+            timeout=timeout,
         )
 
-    def _req_claude_ex(self, cfg, api_key, messages: list, extrabody, extraheader):
+    def _req_claude_ex(self, cfg, api_key, messages: list, extrabody, extraheader, timeout=None):
         sysprompt = messages[0]["content"]
         messages.pop(0)
         cache_control = cfg.get("cachecontext", True)
@@ -483,23 +588,36 @@ class gptcommon(basetrans):
             headers=headers,
             json=data,
             stream=usingstream,
+            timeout=timeout,
         )
         return response
 
-    def _do_request(self, att: dict, messages: list, usingstream: bool):
+    def _do_request(self, att: dict, messages: list, usingstream: bool, gen=None):
         apitype = APIType(att["api_url"])
         cfg = att["cfgview"]
         # gemini / claude 分支会原地修改 messages，这里传副本
         _messages = [dict(m) for m in messages]
+        # 首 token / 无响应超时：
+        #   - 流式：精确的首 token 超时由外层 _ResponseProxy 处理，这里只设宽松的 safety net
+        #     （防止服务器连 HTTP headers 都不返，post() 就挂住）
+        #   - 非流式：用 ft_timeout 作为 requests 的 read timeout，近似“首 token”语义
+        ft_timeout = self._first_token_timeout_s()
+        if ft_timeout > 0:
+            if usingstream:
+                timeout = (5, ft_timeout + 5)
+            else:
+                timeout = (5, ft_timeout)
+        else:
+            timeout = None
         if apitype == APIType.gemini:
             response = self._request_gemini_ex(
                 apitype, cfg, att["api_key"], _messages,
-                att["extrabody"], att["extraheader"],
+                att["extrabody"], att["extraheader"], timeout=timeout,
             )
         elif apitype == APIType.claude:
             response = self._req_claude_ex(
                 cfg, att["api_key"], _messages,
-                att["extrabody"], att["extraheader"],
+                att["extrabody"], att["extraheader"], timeout=timeout,
             )
         else:
             headers = createheaders(
@@ -509,8 +627,13 @@ class gptcommon(basetrans):
                 cfg, self.__parse_qwen_mt_turbo(apitype, _messages), att["extrabody"]
             )
             response = self.proxysession.post(
-                apitype.finalurl(), headers=headers, json=_json, stream=usingstream
+                apitype.finalurl(), headers=headers, json=_json, stream=usingstream,
+                timeout=timeout,
             )
+        # 若请求被外部取消（用户切下一句字幕且开了 cancel_previous_request），
+        # 这里立刻 close 并抛 RequestCancelled，避免继续 fallback 或写缓存。
+        if gen is not None and not self._register_response(gen, response):
+            raise RequestCancelled()
         return response, apitype
 
     def _stream_with_check(self, gen, check_fn):
@@ -553,6 +676,8 @@ class gptcommon(basetrans):
 
     def translate(self, query_2: GptTextWithDict):
         self.checkempty("API接口地址")
+        # 取消机制：登记自己是第几代请求，一旦外部 cancel_previous() 就立刻退出
+        _gen = self._new_request_gen()
         if isinstance(query_2, str):
             query_2 = GptTextWithDict(query_2)
         extrabody, extraheader = getcustombodyheaders(
@@ -584,13 +709,20 @@ class gptcommon(basetrans):
         primary_yielded = False  # 主模型内容是否已经 yield 到 UI
 
         for idx, att in enumerate(attempts):
+            if self._is_cancelled(_gen):
+                return
             is_fb = att["is_fallback"]
             if is_fb and primary_yielded:
                 # 切到 fallback 前清空 UI，避免残留审查/拦截提示文本
                 yield "\0"
                 primary_yielded = False
             try:
-                response, apitype = self._do_request(att, messages, usingstream)
+                response, apitype = self._do_request(att, messages, usingstream, gen=_gen)
+                # 流式 + 首 token 超时启用：用 _ResponseProxy 精确控制首行超时
+                # （requests 的 timeout 是每次 recv 都算，语义不准）
+                ft_timeout = self._first_token_timeout_s()
+                if usingstream and ft_timeout > 0:
+                    response = _ResponseProxy(response, ft_timeout)
                 if usingstream:
                     gen = parsestreamresp(
                         apitype, response, hidethinking, markdown2html, att["model"]
@@ -611,7 +743,12 @@ class gptcommon(basetrans):
                     msg = common_parse_normal_response(
                         response, apitype, hidethinking=hidethinking
                     )
+            except RequestCancelled:
+                # 用户切下一句字幕：直接退出，不 fallback、不写缓存
+                return
             except _FallbackTriggered as ft:
+                if self._is_cancelled(_gen):
+                    return
                 # 流式中途命中审查/拦截正则：立刻撤回 UI，然后切 fallback
                 # 不等 fallback 开始输出才覆盖 —— 就在检测点上马上清空。
                 yield "\0"
@@ -623,6 +760,9 @@ class gptcommon(basetrans):
                     pass
                 continue
             except Exception as e:
+                # 请求被取消：直接退出（response 被 close 会走这里）
+                if self._is_cancelled(_gen):
+                    return
                 # 请求/解析出错：符合条件则切到 fallback
                 if (
                     (not is_fb)
@@ -662,11 +802,15 @@ class gptcommon(basetrans):
                     yield respmessage
             break
 
-        if not (respmessage and query_1.strip() and respmessage.strip()):
-            return
-        # 改为始终使用query来作为history请求
-        self._context.append({"role": "user", "content": query, "query_1": query_1})
-        self._context.append({"role": "assistant", "content": respmessage})
+        try:
+            if not (respmessage and query_1.strip() and respmessage.strip()):
+                return
+            # 改为始终使用query来作为history请求
+            self._context.append({"role": "user", "content": query, "query_1": query_1})
+            self._context.append({"role": "assistant", "content": respmessage})
+        finally:
+            # 无论正常/异常退出，都把当前 response 从"在飞"集合里摘掉
+            self._unregister_response(self._current_response)
 
     def __parse_qwen_mt_turbo(self, apitype: APIType, messages: list):
         if self.config["model"].startswith("qwen-mt-") and apitype == APIType.aliyuncs:
@@ -778,6 +922,7 @@ class gptcommon(basetrans):
             messages,
             extrabody,
             extraheader,
+            timeout=None,
         )
 
     def req_claude(self, messages: list, extrabody, extraheader, cache_control):
@@ -788,4 +933,5 @@ class gptcommon(basetrans):
             messages,
             extrabody,
             extraheader,
+            timeout=None,
         )
