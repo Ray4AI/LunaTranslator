@@ -1,0 +1,88 @@
+# 精简版发布流程：只构建 LunaTranslator_x64.zip 并创建 GitHub Release。
+#
+# 与 upstream 的 release.yml 相比去掉了：
+#   - SignPath 代码签名（fork 无 SIGNPATH_APITOKEN secret）
+#   - x86_winxp / x86_win7 / x64_win7 三个变体（只留 x64/win10）
+#   - 上报 lunatranslator.org 的更新通知
+#
+# 产物：LunaTranslator_x64.zip（含 LunaTranslator_x64/ 目录），挂到新 tag 的 Release 上。
+
+name: Release x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag（必须唯一，upstream 的 v10.17.1.9 已被占用）"
+        required: true
+        default: "v10.17.1.9-fallback.1"
+      prerelease:
+        description: "标记为 pre-release"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # 与 buildluna.yml 中 x64/win10 matrix 完全一致的构建链路
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13.13"
+          architecture: x64
+
+      - run: C:\hostedtoolcache\windows\Python\3.13.13\x64\python src/scripts/build_lunatranslator.py cpp x64 win10
+      - run: C:\hostedtoolcache\windows\Python\3.13.13\x64\python src/scripts/build_lunatranslator.py hook x64 win10
+      - run: C:\hostedtoolcache\windows\Python\3.13.13\x64\python src/scripts/build_lunatranslator.py pyrt x64 3.13.13 win10
+      - run: C:\hostedtoolcache\windows\Python\3.13.13\x64\python src/scripts/build_lunatranslator.py merge x64 win10
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LunaTranslator_x64
+          path: src/build/LunaTranslator_x64
+
+  release:
+    runs-on: windows-latest
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: LunaTranslator_x64
+          path: build/LunaTranslator_x64
+
+      # 打成 LunaTranslator_x64.zip（zip 根下是 LunaTranslator_x64/ 目录，与 upstream 格式一致）
+      - name: Pack zip
+        run: |
+          python -c "import shutil; shutil.make_archive('LunaTranslator_x64', 'zip', 'build', 'LunaTranslator_x64')"
+          python -c "import os; print('zip size:', os.path.getsize('LunaTranslator_x64.zip'), 'bytes')"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: LunaTranslator ${{ github.event.inputs.tag }}
+          body: |
+            Fork 版本，在 upstream `v10.17.1.9` 基础上新增 `chatgpt-3rd-party` 的 **fallback 请求 + 正则触发**。
+
+            ### 新增功能
+            - 主模型响应 / 错误文本命中自定义正则时，自动 fallback 到备用模型
+            - 独立的 Fallback 提供商配置页（URL / API Key / 模型 / 请求参数 / extrabody / headers）
+            - `fallback.SECRET_KEY` 支持 `|` 分隔多 key 轮转
+            - 支持 openai 兼容 / gemini / claude 三类 API 互切
+
+            ### 使用方式
+            1. 翻译设置 → 大模型 → `chatgpt-3rd-party` 设置
+            2. 勾选「启用 Fallback」
+            3. 填写「Fallback 触发正则」（每行一条），例如：
+               `内容.*违规|包含.*敏感|被拦截|不允许服务|审核不通过|sensitive|blocked|violates`
+            4. 点击「配置 Fallback 提供商...」填写备用 API / 模型 / extrabody
+
+            详细说明见仓库 `tests/README.md`。
+          files: LunaTranslator_x64.zip
+          prerelease: ${{ github.event.inputs.prerelease }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
